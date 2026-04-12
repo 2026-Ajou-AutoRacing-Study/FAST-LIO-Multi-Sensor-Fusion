@@ -1048,7 +1048,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         ekfom_data.h(2) = res.z();
         // jacobian (estimate heading)
         ekfom_data.h_x.block<3, 3>(0, 0) = -Eigen::Matrix3d::Identity(); // d_dp
-        ekfom_data.h_x.block<3, 3>(3, 3) = s.rot.toRotationMatrix() * angv_crossmat; // d_dq
+        ekfom_data.h_x.block<3, 3>(0, 3) = s.rot.toRotationMatrix() * angv_crossmat; // d_dq
         if (extrinsic_leverarm_en){
             ekfom_data.h_x.block<3, 3>(0, 30) = -s.rot.toRotationMatrix(); // d_dTGI
         }
