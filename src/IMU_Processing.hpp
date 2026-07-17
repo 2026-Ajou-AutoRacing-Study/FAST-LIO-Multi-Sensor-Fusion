@@ -48,6 +48,15 @@ class ImuProcess
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  V3D get_angular_velocity() const { return angvel_last; }
+  void set_gnss_heading_initialization(bool enabled)
+  {
+    gnss_heading_need_init_ = enabled;
+  }
+  void set_defer_gnss_update(bool enabled)
+  {
+    defer_gnss_update_ = enabled;
+  }
   Eigen::Matrix<double, 12, 12> Q;
   void Process(MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
@@ -86,6 +95,7 @@ class ImuProcess
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
   bool   gnss_heading_need_init_ = true;
+  bool   defer_gnss_update_ = false;
 
   M3D Wheel_R_wrt_IMU;
   V3D Wheel_T_wrt_IMU;
@@ -276,7 +286,7 @@ void ImuProcess::UndistortPcl(MeasureGroup &meas, esekfom::esekf<state_ikfom, 12
   const double &pcl_end_time = meas.lidar_end_time;
 
     /*** case when gnss meas is in the last lidar scan period but received in this period ***/
-    if (USE_GNSS && !meas.gnss.empty())
+    if (USE_GNSS && !defer_gnss_update_ && !meas.gnss.empty())
     {
         double gnss_time = meas.gnss.front()->header.stamp.toSec();
         if (gnss_time < last_lidar_end_time_) // gnss is in the last period
@@ -351,35 +361,52 @@ void ImuProcess::UndistortPcl(MeasureGroup &meas, esekfom::esekf<state_ikfom, 12
     Q.block<3, 3>(3, 3).diagonal() = cov_acc;
     Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
-    //向前传播
-    kf_state.predict(dt, Q, in);// normal predict
-
-    /*** update by gnss meas ***/
-    if (USE_GNSS && !meas.gnss.empty())
+    /*** propagate to each GNSS timestamp, update, then finish the IMU interval ***/
+    const double prediction_end_time = tail->header.stamp.toSec();
+    const double prediction_start_time = prediction_end_time - dt;
+    double propagated_time = prediction_start_time;
+    const double time_epsilon = 1.0e-6;
+    if (USE_GNSS && !defer_gnss_update_)
     {
-        double gnss_time = meas.gnss.front()->header.stamp.toSec();
-        if (gnss_time < head->header.stamp.toSec()){
-            meas.gnss.pop_front();
-        }else{
-            if (gnss_time < tail->header.stamp.toSec()){ // gnss位于两个imu之间
-                opt_with_gnss = true;
-                if (!gnss_heading_need_init_)
-                {
-                    if (meas.gnss.front()->pose.covariance[0] < 200) // 航向初始化未完成或gnss水平噪声大于200不进行更新（遮挡区域）
-                    {
-                        kf_state.update_iterated_dyn_share(); // gnss更新
-                        cout << to_string(gnss_time) << " gnss update !" << endl;
-                    }else{
-                        ROS_WARN("gnss too noise !");
-                    }
-                }else{
-                    ROS_WARN("gnss not initialized !");
-                }
-                opt_with_gnss = false;
-                meas.gnss.pop_front();
-            }
+      while (!meas.gnss.empty())
+      {
+        const double gnss_time = meas.gnss.front()->header.stamp.toSec();
+        if (gnss_time < prediction_start_time - time_epsilon)
+        {
+          meas.gnss.pop_front();
+          continue;
         }
+        if (gnss_time > prediction_end_time + time_epsilon)
+          break;
+
+        double dt_to_gnss = std::max(0.0, gnss_time - propagated_time);
+        if (dt_to_gnss > 0.0)
+          kf_state.predict(dt_to_gnss, Q, in);
+        propagated_time += dt_to_gnss;
+
+        opt_with_gnss = true;
+        if (!gnss_heading_need_init_)
+        {
+          if (meas.gnss.front()->pose.covariance[0] < 200)
+          {
+            kf_state.update_iterated_dyn_share();
+          }
+          else
+          {
+            ROS_WARN("gnss too noise !");
+          }
+        }
+        else
+        {
+          ROS_WARN("gnss not initialized !");
+        }
+        opt_with_gnss = false;
+        meas.gnss.pop_front();
+      }
     }
+    double remaining_dt = prediction_end_time - propagated_time;
+    if (remaining_dt > 0.0)
+      kf_state.predict(remaining_dt, Q, in);
       /*** update by wheel meas ***/
       if (USE_WHEEL && !meas.wheel.empty())
       {
@@ -413,7 +440,7 @@ void ImuProcess::UndistortPcl(MeasureGroup &meas, esekfom::esekf<state_ikfom, 12
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
   kf_state.predict(dt, Q, in);
-  
+
   imu_state = kf_state.get_x();
   last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;

@@ -56,6 +56,7 @@
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <geometry_msgs/Vector3.h>
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include <livox_ros_driver/CustomMsg.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
@@ -63,6 +64,7 @@
 // gnss
 #include "GNSS_Processing.hpp"
 #include "sensor_msgs/NavSatFix.h"
+#include "sensor_msgs/NavSatStatus.h"
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -88,6 +90,11 @@ mutex veloLock;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, lid_topic_left, lid_topic_right, imu_topic, wheel_topic;
+string odom_topic = "/Odometry";
+string initial_pose_topic = "/localization/initialpose";
+string camera_init_frame = "camera_init";
+string body_frame = "body";
+string external_gnss_reference_frame = "morai_map";
 double wheel_velocity = 0.0;
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -170,6 +177,17 @@ ros::Publisher pubGnssCov;
 bool extrinsic_leverarm_en;
 V3D Gnss_T_wrt_IMU(Zero3d);
 bool gnss_inited = false ;                        //  是否完成gnss初始化
+bool use_external_gnss_alignment = false;
+bool external_initial_pose_received = false;
+bool gnss_require_valid_status = true;
+bool gnss_use_utm_projection = false;
+bool gnss_position_only_update = false;
+double gnss_max_position_variance = 200.0;
+double gnss_position_covariance_floor = 0.0;
+unsigned long gnss_update_count = 0;
+M3D camera_from_external_gnss_rotation(Eye3d);
+M3D external_initial_base_rotation(Eye3d);
+V3D camera_gnss_origin(Zero3d);
 shared_ptr<GnssProcess> p_gnss(new GnssProcess());
 GnssProcess gnss_data;
 ros::Publisher pubGnssPath ;
@@ -619,43 +637,69 @@ void wheel_cbk(const nav_msgs::OdometryConstPtr &msg)
 
 void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
 {
-    //  ROS_INFO("GNSS DATA IN ");
     double timestamp = msg_in->header.stamp.toSec();
-
-    mtx_buffer.lock();
-
-    // 没有进行时间纠正
-    if (timestamp < last_timestamp_gnss)
+    if (timestamp <= 0.0 || !std::isfinite(msg_in->latitude) ||
+        !std::isfinite(msg_in->longitude) || !std::isfinite(msg_in->altitude))
     {
-        ROS_WARN("gnss loop back, clear buffer");
-        gnss_buffer.clear();
+        ROS_WARN_THROTTLE(2.0, "Rejecting invalid GNSS timestamp/LLA");
+        return;
+    }
+    if (gnss_require_valid_status && msg_in->status.status < sensor_msgs::NavSatStatus::STATUS_FIX)
+    {
+        ROS_WARN_THROTTLE(2.0, "Rejecting GNSS without a valid fix");
+        return;
     }
 
-    last_timestamp_gnss = timestamp;
+    const double cov_x = msg_in->position_covariance[0];
+    const double cov_y = msg_in->position_covariance[4];
+    const double cov_z = msg_in->position_covariance[8];
+    if (!std::isfinite(cov_x) || !std::isfinite(cov_y) || !std::isfinite(cov_z) ||
+        cov_x <= 0.0 || cov_y <= 0.0 || cov_z <= 0.0 ||
+        cov_x > gnss_max_position_variance || cov_y > gnss_max_position_variance ||
+        cov_z > gnss_max_position_variance)
+    {
+        ROS_WARN_THROTTLE(2.0, "Rejecting GNSS with invalid/excessive covariance");
+        return;
+    }
+    if (use_external_gnss_alignment && !external_initial_pose_received)
+    {
+        ROS_WARN_THROTTLE(2.0, "Waiting for external initial pose before GNSS fusion");
+        return;
+    }
 
-    // convert ROS NavSatFix to GeographicLib compatible GNSS message:
     gnss_data.time = timestamp;
     gnss_data.status = msg_in->status.status;
     gnss_data.service = msg_in->status.service;
-    gnss_data.pose_cov[0] = msg_in->position_covariance[0];
-    gnss_data.pose_cov[1] = msg_in->position_covariance[4];
-    gnss_data.pose_cov[2] = msg_in->position_covariance[8];
-
-    mtx_buffer.unlock();
+    gnss_data.pose_cov[0] = cov_x;
+    gnss_data.pose_cov[1] = cov_y;
+    gnss_data.pose_cov[2] = cov_z;
 
     if(!gnss_inited){           //  初始化位置
         gnss_data.InitOriginPosition(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;
         state_ikfom init_state = kf.get_x(); // 初始状态量
         init_state.offset_T_G_I = Gnss_T_wrt_IMU;
         kf.change_x(init_state);
+        if (use_external_gnss_alignment)
+        {
+            const M3D camera_body_rotation = init_state.rot.toRotationMatrix();
+            camera_from_external_gnss_rotation =
+                camera_body_rotation * external_initial_base_rotation.transpose();
+            camera_gnss_origin =
+                init_state.pos + camera_body_rotation * Gnss_T_wrt_IMU;
+            ROS_INFO_STREAM("External GNSS alignment initialized; camera GNSS origin="
+                            << camera_gnss_origin.transpose());
+        }
         gnss_inited = true ;
     }else{                               //   初始化完成
         gnss_data.UpdateXYZ(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;             //  WGS84 -> ENU
 
         Eigen::Matrix4d gnss_pose = Eigen::Matrix4d::Identity();
-        gnss_pose(0,3) = gnss_data.local_E ;                 //    东
-        gnss_pose(1,3) = gnss_data.local_N ;                 //     北
-        gnss_pose(2,3) = gnss_data.local_U ;                 //    天
+        V3D gnss_position(gnss_data.local_E, gnss_data.local_N, gnss_data.local_U);
+        if (use_external_gnss_alignment)
+            gnss_position = camera_gnss_origin + camera_from_external_gnss_rotation * gnss_position;
+        gnss_pose(0,3) = gnss_position.x();
+        gnss_pose(1,3) = gnss_position.y();
+        gnss_pose(2,3) = gnss_position.z();
 
         nav_msgs::Odometry::Ptr gnss_data_enu(new nav_msgs::Odometry());
         // add new message to buffer:
@@ -669,15 +713,20 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         gnss_data_enu->pose.pose.orientation.z =  geoQuat.z;
         gnss_data_enu->pose.pose.orientation.w =  geoQuat.w;
 
-        if (gnss_data.pose_cov[0] == 0 && gnss_data.pose_cov[1] == 0 && gnss_data.pose_cov[2] == 0){
-            ROS_ERROR("Gnss cov invalid");
-            return;
-        }
         gnss_data_enu->pose.covariance[0] = gnss_data.pose_cov[0] ;
         gnss_data_enu->pose.covariance[7] = gnss_data.pose_cov[1] ;
         gnss_data_enu->pose.covariance[14] = gnss_data.pose_cov[2] ;
 
-        gnss_buffer.push_back(gnss_data_enu);
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            if (timestamp < last_timestamp_gnss)
+            {
+                ROS_WARN("gnss loop back, clear buffer");
+                gnss_buffer.clear();
+            }
+            last_timestamp_gnss = timestamp;
+            gnss_buffer.push_back(gnss_data_enu);
+        }
 
         // visual gnss path in rviz:
         msg_gnss_pose.header.frame_id = "camera_init";
@@ -699,6 +748,33 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
     }
 
 
+}
+
+void initial_pose_cbk(const geometry_msgs::PoseWithCovarianceStampedConstPtr& msg)
+{
+    if (!use_external_gnss_alignment)
+        return;
+    string frame = msg->header.frame_id;
+    if (!frame.empty() && frame.front() == '/')
+        frame.erase(0, 1);
+    if (frame != external_gnss_reference_frame)
+    {
+        ROS_ERROR_THROTTLE(2.0, "Initial pose frame must be %s, received %s",
+                           external_gnss_reference_frame.c_str(), frame.c_str());
+        return;
+    }
+    const auto& q_msg = msg->pose.pose.orientation;
+    Eigen::Quaterniond q(q_msg.w, q_msg.x, q_msg.y, q_msg.z);
+    if (!std::isfinite(q.norm()) || q.norm() < 1.0e-9)
+    {
+        ROS_ERROR_THROTTLE(2.0, "Rejecting invalid external initial pose quaternion");
+        return;
+    }
+    q.normalize();
+    external_initial_base_rotation = q.toRotationMatrix();
+    external_initial_pose_received = true;
+    ROS_INFO("Received external GNSS initial pose in frame %s",
+             external_gnss_reference_frame.c_str());
 }
 
 double lidar_mean_scantime = 0.0;
@@ -967,23 +1043,26 @@ void set_posestamp(T & out)
 
 void publish_odometry(const ros::Publisher &pubOdomAftMapped)
 {
-    odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
+    odomAftMapped.header.frame_id = camera_init_frame;
+    odomAftMapped.child_frame_id = body_frame;
     odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    if (pubOdomAftMapped.getNumSubscribers() != 0)
-        pubOdomAftMapped.publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
-        int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
+        for (int j = 0; j < 6; ++j)
+            odomAftMapped.pose.covariance[i*6 + j] = P(i, j);
     }
+    const V3D velocity_body = state_point.rot.toRotationMatrix().transpose() * state_point.vel;
+    const V3D angular_velocity_body = p_imu->get_angular_velocity();
+    odomAftMapped.twist.twist.linear.x = velocity_body.x();
+    odomAftMapped.twist.twist.linear.y = velocity_body.y();
+    odomAftMapped.twist.twist.linear.z = velocity_body.z();
+    odomAftMapped.twist.twist.angular.x = angular_velocity_body.x();
+    odomAftMapped.twist.twist.angular.y = angular_velocity_body.y();
+    odomAftMapped.twist.twist.angular.z = angular_velocity_body.z();
+    if (pubOdomAftMapped.getNumSubscribers() != 0)
+        pubOdomAftMapped.publish(odomAftMapped);
 
     static tf::TransformBroadcaster br;
     tf::Transform                   transform;
@@ -996,7 +1075,8 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped)
     q.setY(odomAftMapped.pose.pose.orientation.y);
     q.setZ(odomAftMapped.pose.pose.orientation.z);
     transform.setRotation( q );
-    br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "camera_init", "body" ) );
+    br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp,
+                                            camera_init_frame, body_frame ) );
 }
 
 void publish_path(const ros::Publisher pubPath)
@@ -1048,7 +1128,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         ekfom_data.h(2) = res.z();
         // jacobian (estimate heading)
         ekfom_data.h_x.block<3, 3>(0, 0) = -Eigen::Matrix3d::Identity(); // d_dp
-        ekfom_data.h_x.block<3, 3>(0, 3) = s.rot.toRotationMatrix() * angv_crossmat; // d_dq
+        if (!gnss_position_only_update)
+            ekfom_data.h_x.block<3, 3>(0, 3) = s.rot.toRotationMatrix() * angv_crossmat; // d_dq
         if (extrinsic_leverarm_en){
             ekfom_data.h_x.block<3, 3>(0, 30) = -s.rot.toRotationMatrix(); // d_dTGI
         }
@@ -1230,6 +1311,72 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time += omp_get_wtime() - solve_start_;
 }
 
+void apply_external_gnss_update()
+{
+    if (!USE_GNSS || !use_external_gnss_alignment || Measures.gnss.empty())
+        return;
+
+    while (Measures.gnss.size() > 1)
+        Measures.gnss.pop_front();
+    const auto measurement = Measures.gnss.front();
+    if (measurement->pose.covariance[0] > gnss_max_position_variance ||
+        measurement->pose.covariance[7] > gnss_max_position_variance ||
+        measurement->pose.covariance[14] > gnss_max_position_variance)
+    {
+        ROS_WARN_THROTTLE(2.0, "Skipping excessive GNSS covariance at scan end");
+        Measures.gnss.pop_front();
+        return;
+    }
+
+    if (gnss_position_covariance_floor > 0.0)
+    {
+        auto covariance = kf.get_P();
+        for (int axis = 0; axis < 3; ++axis)
+            covariance(axis, axis) = std::max(
+                covariance(axis, axis), gnss_position_covariance_floor);
+        kf.change_P(covariance);
+    }
+
+    if (gnss_position_only_update)
+    {
+        // Keep FAST-LIO's locally estimated attitude, velocity, and IMU biases.
+        // A single GNSS antenna directly observes only its global position.
+        auto state = kf.get_x();
+        auto covariance = kf.get_P();
+        const V3D measured_antenna(
+            measurement->pose.pose.position.x,
+            measurement->pose.pose.position.y,
+            measurement->pose.pose.position.z);
+        const V3D predicted_antenna =
+            state.pos + state.rot.toRotationMatrix() * state.offset_T_G_I;
+        const V3D innovation = measured_antenna - predicted_antenna;
+
+        M3D measurement_covariance = M3D::Zero();
+        measurement_covariance(0, 0) = measurement->pose.covariance[0];
+        measurement_covariance(1, 1) = measurement->pose.covariance[7];
+        measurement_covariance(2, 2) = measurement->pose.covariance[14];
+        const M3D position_covariance = covariance.block<3, 3>(0, 0);
+        const M3D kalman_gain = position_covariance *
+            (position_covariance + measurement_covariance).inverse();
+
+        state.pos += kalman_gain * innovation;
+        covariance.block<3, 3>(0, 0) =
+            (M3D::Identity() - kalman_gain) * position_covariance;
+        kf.change_x(state);
+        kf.change_P(covariance);
+    }
+    else
+    {
+        opt_with_gnss = true;
+        kf.update_iterated_dyn_share();
+        opt_with_gnss = false;
+    }
+    Measures.gnss.pop_front();
+    ++gnss_update_count;
+    ROS_INFO_STREAM_THROTTLE(5.0, "Post-LiDAR GNSS updates applied: "
+                             << gnss_update_count);
+}
+
 int main(int argc, char** argv)
 {
     // allocateMemory();
@@ -1311,6 +1458,17 @@ int main(int argc, char** argv)
     cout << "use_gnss " << int(USE_GNSS) << endl;
     nh.param<bool>("mapping/extrinsic_leverarm_en", extrinsic_leverarm_en, false);
     nh.param<vector<double>>("mapping/extrinT_Gnss2IMU", extrinT_Gnss2IMU, vector<double>());
+    nh.param<bool>("gnss/use_external_alignment", use_external_gnss_alignment, false);
+    nh.param<string>("gnss/initial_pose_topic", initial_pose_topic, "/localization/initialpose");
+    nh.param<string>("gnss/reference_frame", external_gnss_reference_frame, "morai_map");
+    nh.param<bool>("gnss/require_valid_status", gnss_require_valid_status, true);
+    nh.param<bool>("gnss/use_utm_projection", gnss_use_utm_projection, false);
+    nh.param<bool>("gnss/position_only_update", gnss_position_only_update, false);
+    nh.param<double>("gnss/max_position_variance_m2", gnss_max_position_variance, 200.0);
+    nh.param<double>("gnss/position_covariance_floor_m2", gnss_position_covariance_floor, 0.0);
+    nh.param<string>("output/odom_topic", odom_topic, "/Odometry");
+    nh.param<string>("output/camera_init_frame", camera_init_frame, "camera_init");
+    nh.param<string>("output/body_frame", body_frame, "body");
     
     path.header.stamp    = ros::Time::now();
     path.header.frame_id ="camera_init";
@@ -1339,6 +1497,9 @@ int main(int argc, char** argv)
     p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
     p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+    p_imu->set_gnss_heading_initialization(!use_external_gnss_alignment);
+    p_imu->set_defer_gnss_update(use_external_gnss_alignment);
+    gnss_data.set_use_utm_projection(gnss_use_utm_projection);
 
     Wheel_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT_wheel);
     Wheel_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR_wheel);
@@ -1382,6 +1543,9 @@ int main(int argc, char** argv)
     ros::Subscriber sub_gnss;
     if (USE_GNSS)
         sub_gnss = nh.subscribe(gnss_topic, 200000, gnss_cbk);
+    ros::Subscriber sub_initial_pose;
+    if (USE_GNSS && use_external_gnss_alignment)
+        sub_initial_pose = nh.subscribe(initial_pose_topic, 10, initial_pose_cbk);
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_registered", 100000);
     ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>
@@ -1391,7 +1555,7 @@ int main(int argc, char** argv)
     ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>
             ("/Laser_map", 100000);
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry> 
-            ("/Odometry", 100000);
+            (odom_topic, 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
     ros::Publisher pubGnssPath = nh.advertise<nav_msgs::Path>("/gnss_path", 100000);
@@ -1516,6 +1680,7 @@ int main(int argc, char** argv)
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+            apply_external_gnss_update();
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;

@@ -25,6 +25,7 @@
 #include "use-ikfom.hpp"
 
 #include <GeographicLib/LocalCartesian.hpp>                 //  调用GeographicLib库
+#include <GeographicLib/UTMUPS.hpp>
 
 class GnssProcess
 {
@@ -51,6 +52,7 @@ class GnssProcess
 
     void InitOriginPosition(double latitude, double longitude, double altitude);
     void UpdateXYZ(double latitude, double longitude, double altitude);
+    void set_use_utm_projection(bool enabled) { use_utm_projection = enabled; }
 
     void Reverse(
       const double &local_E, const double &local_N, const double &local_U,
@@ -63,6 +65,11 @@ class GnssProcess
 
   private:
     GeographicLib::LocalCartesian geo_converter;
+    bool use_utm_projection = false;
+    int utm_zone = GeographicLib::UTMUPS::STANDARD;
+    bool utm_north = true;
+    double origin_easting = 0.0;
+    double origin_northing = 0.0;
 
     M3D Gnss_R_wrt_Lidar ;
     V3D Gnss_T_wrt_Lidar;
@@ -90,7 +97,15 @@ GnssProcess::~GnssProcess() {}
 // 初始化原点， WGS84 -> ENU   ???  调试结果好像是 NED 北东地
 void GnssProcess::InitOriginPosition(double latitude, double longitude, double altitude)
 {
-    geo_converter.Reset(latitude, longitude, altitude);
+    if (use_utm_projection)
+    {
+        GeographicLib::UTMUPS::Forward(latitude, longitude, utm_zone, utm_north,
+                                        origin_easting, origin_northing);
+    }
+    else
+    {
+        geo_converter.Reset(latitude, longitude, altitude);
+    }
     ROS_INFO("Init    Gnss  OriginPosition");   
     origin_latitude = latitude;
     origin_longitude = longitude;
@@ -99,14 +114,39 @@ void GnssProcess::InitOriginPosition(double latitude, double longitude, double a
 
 // 获取更新后的ENU坐标
 void GnssProcess::UpdateXYZ(double latitude, double longitude, double altitude) {
-    geo_converter.Forward(latitude, longitude, altitude, local_E, local_N, local_U);
+    if (use_utm_projection)
+    {
+        int zone = utm_zone;
+        bool north = utm_north;
+        double easting = 0.0;
+        double northing = 0.0;
+        GeographicLib::UTMUPS::Forward(latitude, longitude, zone, north,
+                                        easting, northing, utm_zone);
+        local_E = easting - origin_easting;
+        local_N = northing - origin_northing;
+        local_U = altitude - origin_altitude;
+    }
+    else
+    {
+        geo_converter.Forward(latitude, longitude, altitude, local_E, local_N, local_U);
+    }
 }
 
 void GnssProcess::Reverse(
     const double &local_E, const double &local_N, const double &local_U,
     double &lat, double &lon, double &alt
 ) {
-    geo_converter.Reverse(local_E, local_N, local_U, lat, lon, alt);
+    if (use_utm_projection)
+    {
+        GeographicLib::UTMUPS::Reverse(utm_zone, utm_north,
+                                        origin_easting + local_E,
+                                        origin_northing + local_N, lat, lon);
+        alt = origin_altitude + local_U;
+    }
+    else
+    {
+        geo_converter.Reverse(local_E, local_N, local_U, lat, lon, alt);
+    }
 }
 
 void GnssProcess::set_extrinsic(const MD(4,4) &T)
@@ -126,5 +166,4 @@ void GnssProcess::set_extrinsic(const V3D &transl, const M3D &rot)
   Gnss_T_wrt_Lidar = transl;
   Gnss_R_wrt_Lidar = rot;
 }
-
 
