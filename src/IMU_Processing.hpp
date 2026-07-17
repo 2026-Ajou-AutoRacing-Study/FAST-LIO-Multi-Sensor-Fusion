@@ -57,6 +57,20 @@ class ImuProcess
   {
     defer_gnss_update_ = enabled;
   }
+  void set_capture_deferred_gnss_prediction(bool enabled)
+  {
+    capture_deferred_gnss_prediction_ = enabled;
+  }
+  bool get_deferred_gnss_prediction(
+      nav_msgs::OdometryConstPtr &measurement,
+      V3D &predicted_antenna) const
+  {
+    if (!deferred_gnss_prediction_valid_)
+      return false;
+    measurement = deferred_gnss_measurement_;
+    predicted_antenna = deferred_gnss_predicted_antenna_;
+    return true;
+  }
   Eigen::Matrix<double, 12, 12> Q;
   void Process(MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
@@ -96,6 +110,10 @@ class ImuProcess
   bool   imu_need_init_ = true;
   bool   gnss_heading_need_init_ = true;
   bool   defer_gnss_update_ = false;
+  bool   capture_deferred_gnss_prediction_ = false;
+  bool   deferred_gnss_prediction_valid_ = false;
+  nav_msgs::OdometryConstPtr deferred_gnss_measurement_;
+  V3D deferred_gnss_predicted_antenna_ = Zero3d;
 
   M3D Wheel_R_wrt_IMU;
   V3D Wheel_T_wrt_IMU;
@@ -143,6 +161,8 @@ void ImuProcess::Reset()
   IMUpose.clear();
   last_imu_.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
+  deferred_gnss_prediction_valid_ = false;
+  deferred_gnss_measurement_.reset();
 }
 
 void ImuProcess::set_extrinsic(const MD(4,4) &T)
@@ -277,6 +297,9 @@ void ImuProcess::IMU_init(MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, in
 
 void ImuProcess::UndistortPcl(MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
 {
+  deferred_gnss_prediction_valid_ = false;
+  deferred_gnss_measurement_.reset();
+
   /*** add the imu of the last frame-tail to the of current frame-head ***/
   auto v_imu = meas.imu;
   v_imu.push_front(last_imu_);
@@ -286,25 +309,35 @@ void ImuProcess::UndistortPcl(MeasureGroup &meas, esekfom::esekf<state_ikfom, 12
   const double &pcl_end_time = meas.lidar_end_time;
 
     /*** case when gnss meas is in the last lidar scan period but received in this period ***/
-    if (USE_GNSS && !defer_gnss_update_ && !meas.gnss.empty())
+    if (USE_GNSS && (!defer_gnss_update_ || capture_deferred_gnss_prediction_) && !meas.gnss.empty())
     {
         double gnss_time = meas.gnss.front()->header.stamp.toSec();
         if (gnss_time < last_lidar_end_time_) // gnss is in the last period
         {
-            opt_with_gnss = true;
-            if (!gnss_heading_need_init_)
+            if (capture_deferred_gnss_prediction_)
             {
-                if (meas.gnss.front()->pose.covariance[0] < 200) // 航向初始化未完成或gnss水平噪声大于200不进行更新（遮挡区域）
-                {
-                    kf_state.update_iterated_dyn_share(); // gnss更新
-                    cout << to_string(gnss_time) << " gnss update !" << endl;
-                }else{
-                    ROS_WARN("gnss too noise !");
-                }
-            }else{
-                ROS_WARN("gnss not initialized !");
+                // The state history needed for an out-of-sequence update is no
+                // longer available.  Applying this old position at the current
+                // state time would create a speed-dependent longitudinal lag.
+                ROS_WARN_THROTTLE(2.0, "Dropping out-of-sequence deferred GNSS measurement");
             }
-            opt_with_gnss = false;
+            else
+            {
+                opt_with_gnss = true;
+                if (!gnss_heading_need_init_)
+                {
+                    if (meas.gnss.front()->pose.covariance[0] < 200) // 航向初始化未完成或gnss水平噪声大于200不进行更新（遮挡区域）
+                    {
+                        kf_state.update_iterated_dyn_share(); // gnss更新
+                        cout << to_string(gnss_time) << " gnss update !" << endl;
+                    }else{
+                        ROS_WARN("gnss too noise !");
+                    }
+                }else{
+                    ROS_WARN("gnss not initialized !");
+                }
+                opt_with_gnss = false;
+            }
             meas.gnss.pop_front();
         }
     }
@@ -366,7 +399,7 @@ void ImuProcess::UndistortPcl(MeasureGroup &meas, esekfom::esekf<state_ikfom, 12
     const double prediction_start_time = prediction_end_time - dt;
     double propagated_time = prediction_start_time;
     const double time_epsilon = 1.0e-6;
-    if (USE_GNSS && !defer_gnss_update_)
+    if (USE_GNSS && (!defer_gnss_update_ || capture_deferred_gnss_prediction_))
     {
       while (!meas.gnss.empty())
       {
@@ -384,23 +417,39 @@ void ImuProcess::UndistortPcl(MeasureGroup &meas, esekfom::esekf<state_ikfom, 12
           kf_state.predict(dt_to_gnss, Q, in);
         propagated_time += dt_to_gnss;
 
-        opt_with_gnss = true;
-        if (!gnss_heading_need_init_)
+        if (capture_deferred_gnss_prediction_)
         {
-          if (meas.gnss.front()->pose.covariance[0] < 200)
-          {
-            kf_state.update_iterated_dyn_share();
-          }
-          else
-          {
-            ROS_WARN("gnss too noise !");
-          }
+          // Preserve the estimator prediction at the actual GNSS timestamp.
+          // laserMapping applies the resulting co-timed position innovation
+          // after the LiDAR update so the global correction is not pulled back
+          // toward the pre-correction incremental map.
+          const auto state_at_gnss = kf_state.get_x();
+          deferred_gnss_measurement_ = meas.gnss.front();
+          deferred_gnss_predicted_antenna_ =
+              state_at_gnss.pos + state_at_gnss.rot.toRotationMatrix() *
+              state_at_gnss.offset_T_G_I;
+          deferred_gnss_prediction_valid_ = true;
         }
         else
         {
-          ROS_WARN("gnss not initialized !");
+          opt_with_gnss = true;
+          if (!gnss_heading_need_init_)
+          {
+            if (meas.gnss.front()->pose.covariance[0] < 200)
+            {
+              kf_state.update_iterated_dyn_share();
+            }
+            else
+            {
+              ROS_WARN("gnss too noise !");
+            }
+          }
+          else
+          {
+            ROS_WARN("gnss not initialized !");
+          }
+          opt_with_gnss = false;
         }
-        opt_with_gnss = false;
         meas.gnss.pop_front();
       }
     }

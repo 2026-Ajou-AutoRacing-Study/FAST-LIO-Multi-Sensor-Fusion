@@ -1313,18 +1313,35 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
 void apply_external_gnss_update()
 {
-    if (!USE_GNSS || !use_external_gnss_alignment || Measures.gnss.empty())
+    if (!USE_GNSS || !use_external_gnss_alignment)
         return;
 
-    while (Measures.gnss.size() > 1)
-        Measures.gnss.pop_front();
-    const auto measurement = Measures.gnss.front();
+    nav_msgs::OdometryConstPtr measurement;
+    V3D predicted_antenna_at_measurement(Zero3d);
+    bool has_timestamp_matched_prediction = false;
+    if (gnss_position_only_update)
+    {
+        has_timestamp_matched_prediction = p_imu->get_deferred_gnss_prediction(
+            measurement, predicted_antenna_at_measurement);
+        if (!has_timestamp_matched_prediction)
+            return;
+    }
+    else
+    {
+        if (Measures.gnss.empty())
+            return;
+        while (Measures.gnss.size() > 1)
+            Measures.gnss.pop_front();
+        measurement = Measures.gnss.front();
+    }
+
     if (measurement->pose.covariance[0] > gnss_max_position_variance ||
         measurement->pose.covariance[7] > gnss_max_position_variance ||
         measurement->pose.covariance[14] > gnss_max_position_variance)
     {
         ROS_WARN_THROTTLE(2.0, "Skipping excessive GNSS covariance at scan end");
-        Measures.gnss.pop_front();
+        if (!has_timestamp_matched_prediction)
+            Measures.gnss.pop_front();
         return;
     }
 
@@ -1347,9 +1364,8 @@ void apply_external_gnss_update()
             measurement->pose.pose.position.x,
             measurement->pose.pose.position.y,
             measurement->pose.pose.position.z);
-        const V3D predicted_antenna =
-            state.pos + state.rot.toRotationMatrix() * state.offset_T_G_I;
-        const V3D innovation = measured_antenna - predicted_antenna;
+        const V3D innovation =
+            measured_antenna - predicted_antenna_at_measurement;
 
         M3D measurement_covariance = M3D::Zero();
         measurement_covariance(0, 0) = measurement->pose.covariance[0];
@@ -1371,7 +1387,8 @@ void apply_external_gnss_update()
         kf.update_iterated_dyn_share();
         opt_with_gnss = false;
     }
-    Measures.gnss.pop_front();
+    if (!has_timestamp_matched_prediction)
+        Measures.gnss.pop_front();
     ++gnss_update_count;
     ROS_INFO_STREAM_THROTTLE(5.0, "Post-LiDAR GNSS updates applied: "
                              << gnss_update_count);
@@ -1499,6 +1516,8 @@ int main(int argc, char** argv)
     p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
     p_imu->set_gnss_heading_initialization(!use_external_gnss_alignment);
     p_imu->set_defer_gnss_update(use_external_gnss_alignment);
+    p_imu->set_capture_deferred_gnss_prediction(
+        use_external_gnss_alignment && gnss_position_only_update);
     gnss_data.set_use_utm_projection(gnss_use_utm_projection);
 
     Wheel_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT_wheel);
