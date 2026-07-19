@@ -63,12 +63,14 @@ class ImuProcess
   }
   bool get_deferred_gnss_prediction(
       nav_msgs::OdometryConstPtr &measurement,
-      V3D &predicted_antenna) const
+      V3D &predicted_antenna,
+      M3D &predicted_body_rotation) const
   {
     if (!deferred_gnss_prediction_valid_)
       return false;
     measurement = deferred_gnss_measurement_;
     predicted_antenna = deferred_gnss_predicted_antenna_;
+    predicted_body_rotation = deferred_gnss_predicted_body_rotation_;
     return true;
   }
   Eigen::Matrix<double, 12, 12> Q;
@@ -114,6 +116,7 @@ class ImuProcess
   bool   deferred_gnss_prediction_valid_ = false;
   nav_msgs::OdometryConstPtr deferred_gnss_measurement_;
   V3D deferred_gnss_predicted_antenna_ = Zero3d;
+  M3D deferred_gnss_predicted_body_rotation_ = Eye3d;
 
   M3D Wheel_R_wrt_IMU;
   V3D Wheel_T_wrt_IMU;
@@ -428,6 +431,8 @@ void ImuProcess::UndistortPcl(MeasureGroup &meas, esekfom::esekf<state_ikfom, 12
           deferred_gnss_predicted_antenna_ =
               state_at_gnss.pos + state_at_gnss.rot.toRotationMatrix() *
               state_at_gnss.offset_T_G_I;
+          deferred_gnss_predicted_body_rotation_ =
+              state_at_gnss.rot.toRotationMatrix();
           deferred_gnss_prediction_valid_ = true;
         }
         else

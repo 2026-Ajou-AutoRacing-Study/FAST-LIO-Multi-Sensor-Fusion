@@ -4,6 +4,21 @@ Fusing GNSS and wheel measurements based on FAST-LIO and IKFOM
 2. Fusing wheel measurement and support the estimation of wheel extrinsic parameters and wheel scale factor meanwhile.
 3. Tested on the Kaist Complex Urban Dataset.
 
+### AjouNice integration note (2026-07-18)
+
+The AjouNice fork adds a MORAI-oriented external GNSS position-only fusion
+path. Both recurring GNSS corrections and the first GNSS local-origin
+alignment use the EKF state propagated to the GNSS measurement timestamp,
+instead of the state available when the ROS callback happens to execute. This
+prevents LiDAR scan-end timing and runtime callback load from changing the
+GNSS residual or the initialized local origin.
+
+The integration keeps wheel input disabled, preserves FAST-LIO attitude,
+velocity, and IMU-bias states during a GNSS position update, and applies the
+configured IMU-to-GNSS antenna lever arm. See
+[`AJOUNICE_CHANGES.md`](AJOUNICE_CHANGES.md) for the exact source changes,
+validation results, and known limitations.
+
 **Related paper and codes**:
 GNSS data handling part refers to [FAST_LIO_SAM](https://github.com/kahowang/FAST_LIO_SAM).
 Wheel fusion part refers to [Vehicle-Motion-Constraint-Based Visual-Inertial-Odometer Fusion With Online Extrinsic Calibration](https://ieeexplore.ieee.org/abstract/document/10272296). If you'd like to use this wheel fusion part of this package for academic research please cite this paper.

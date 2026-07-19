@@ -177,6 +177,7 @@ ros::Publisher pubGnssCov;
 bool extrinsic_leverarm_en;
 V3D Gnss_T_wrt_IMU(Zero3d);
 bool gnss_inited = false ;                        //  是否完成gnss初始化
+bool external_gnss_origin_initialized = false;
 bool use_external_gnss_alignment = false;
 bool external_initial_pose_received = false;
 bool gnss_require_valid_status = true;
@@ -674,28 +675,35 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
     gnss_data.pose_cov[1] = cov_y;
     gnss_data.pose_cov[2] = cov_z;
 
+    bool first_gnss_measurement = false;
     if(!gnss_inited){           //  初始化位置
         gnss_data.InitOriginPosition(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;
         state_ikfom init_state = kf.get_x(); // 初始状态量
         init_state.offset_T_G_I = Gnss_T_wrt_IMU;
         kf.change_x(init_state);
-        if (use_external_gnss_alignment)
-        {
-            const M3D camera_body_rotation = init_state.rot.toRotationMatrix();
-            camera_from_external_gnss_rotation =
-                camera_body_rotation * external_initial_base_rotation.transpose();
-            camera_gnss_origin =
-                init_state.pos + camera_body_rotation * Gnss_T_wrt_IMU;
-            ROS_INFO_STREAM("External GNSS alignment initialized; camera GNSS origin="
-                            << camera_gnss_origin.transpose());
-        }
         gnss_inited = true ;
-    }else{                               //   初始化完成
+        first_gnss_measurement = true;
+    }
+
+    // Preserve the upstream non-external path: its first sample only defines
+    // the WGS84-to-local origin and is not queued as a measurement.
+    if (first_gnss_measurement && !use_external_gnss_alignment)
+        return;
+
+    if (gnss_inited) {                               //   初始化完成
+        if (!first_gnss_measurement)
+        {
         gnss_data.UpdateXYZ(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;             //  WGS84 -> ENU
+        }
 
         Eigen::Matrix4d gnss_pose = Eigen::Matrix4d::Identity();
-        V3D gnss_position(gnss_data.local_E, gnss_data.local_N, gnss_data.local_U);
-        if (use_external_gnss_alignment)
+        V3D gnss_position = first_gnss_measurement
+            ? V3D(Zero3d)
+            : V3D(gnss_data.local_E, gnss_data.local_N, gnss_data.local_U);
+        // In external-alignment mode the buffer carries the raw local GNSS
+        // displacement. It is rotated and translated only after the first
+        // GNSS timestamp has been matched to the propagated EKF state.
+        if (!use_external_gnss_alignment)
             gnss_position = camera_gnss_origin + camera_from_external_gnss_rotation * gnss_position;
         gnss_pose(0,3) = gnss_position.x();
         gnss_pose(1,3) = gnss_position.y();
@@ -1318,11 +1326,13 @@ void apply_external_gnss_update()
 
     nav_msgs::OdometryConstPtr measurement;
     V3D predicted_antenna_at_measurement(Zero3d);
+    M3D predicted_body_rotation_at_measurement(Eye3d);
     bool has_timestamp_matched_prediction = false;
     if (gnss_position_only_update)
     {
         has_timestamp_matched_prediction = p_imu->get_deferred_gnss_prediction(
-            measurement, predicted_antenna_at_measurement);
+            measurement, predicted_antenna_at_measurement,
+            predicted_body_rotation_at_measurement);
         if (!has_timestamp_matched_prediction)
             return;
     }
@@ -1345,25 +1355,43 @@ void apply_external_gnss_update()
         return;
     }
 
-    if (gnss_position_covariance_floor > 0.0)
-    {
-        auto covariance = kf.get_P();
-        for (int axis = 0; axis < 3; ++axis)
-            covariance(axis, axis) = std::max(
-                covariance(axis, axis), gnss_position_covariance_floor);
-        kf.change_P(covariance);
-    }
-
     if (gnss_position_only_update)
     {
+        if (!external_gnss_origin_initialized)
+        {
+            camera_gnss_origin = predicted_antenna_at_measurement;
+            camera_from_external_gnss_rotation =
+                predicted_body_rotation_at_measurement *
+                external_initial_base_rotation.transpose();
+            external_gnss_origin_initialized = true;
+            ROS_INFO_STREAM("Timestamp-matched external GNSS alignment initialized at "
+                            << std::fixed << std::setprecision(9)
+                            << measurement->header.stamp.toSec()
+                            << "; camera GNSS origin="
+                            << camera_gnss_origin.transpose());
+            return;
+        }
+
+        if (gnss_position_covariance_floor > 0.0)
+        {
+            auto floored_covariance = kf.get_P();
+            for (int axis = 0; axis < 3; ++axis)
+                floored_covariance(axis, axis) = std::max(
+                    floored_covariance(axis, axis),
+                    gnss_position_covariance_floor);
+            kf.change_P(floored_covariance);
+        }
+
         // Keep FAST-LIO's locally estimated attitude, velocity, and IMU biases.
         // A single GNSS antenna directly observes only its global position.
         auto state = kf.get_x();
         auto covariance = kf.get_P();
-        const V3D measured_antenna(
+        const V3D measured_local_displacement(
             measurement->pose.pose.position.x,
             measurement->pose.pose.position.y,
             measurement->pose.pose.position.z);
+        const V3D measured_antenna = camera_gnss_origin +
+            camera_from_external_gnss_rotation * measured_local_displacement;
         const V3D innovation =
             measured_antenna - predicted_antenna_at_measurement;
 

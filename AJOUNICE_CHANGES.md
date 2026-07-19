@@ -177,15 +177,104 @@ A separate test reduced the covariance floor from 0.25 m² to 0.05 m². It
 worsened XY RMSE to about 0.401 m and longitudinal/lateral errors also grew,
 so the parent configuration retains 0.25 m².
 
+## 2026-07-18 timestamp-matched first GNSS origin initialization
+
+### Reproducibility problem
+
+The 2026-07-17 correction made each recurring GNSS residual timestamp
+consistent, but the first external GNSS origin still used `kf.get_x()` inside
+`gnss_cbk()`. That state represented the latest EKF state when the callback
+was scheduled, not necessarily the state at the first GNSS message timestamp.
+Different recording and runtime loads therefore produced different origins
+from the same sensor bag.
+
+Two pre-fix executions initialized the camera-frame GNSS origin as follows:
+
+```text
+lightweight internal run: [-1.50191, -0.0203349, 1.03464]
+full user recording:      [-1.52743,  0.0023697, 1.02935]
+XY origin difference:      0.0342 m
+```
+
+The trajectories were identical before the first GNSS update and began to
+diverge immediately after it. Incremental LiDAR map updates then amplified
+the small initial difference.
+
+### Implementation
+
+The first valid GNSS sample now initializes only the WGS84-to-local coordinate
+origin and queues a zero local displacement with its original timestamp. IMU
+propagation captures both the predicted antenna position and body rotation at
+that exact timestamp. The post-LiDAR GNSS stage then initializes:
+
+```text
+camera_gnss_origin = predicted_antenna_position(t_first_gnss)
+
+camera_from_external_gnss_rotation
+    = predicted_body_rotation(t_first_gnss)
+    * inverse(external_initial_base_rotation)
+```
+
+Later GNSS measurements remain local displacements until this timestamp-matched
+rotation and translation are applied. The first sample defines the coordinate
+relationship and does not perform a position correction.
+
+Files changed:
+
+- `src/IMU_Processing.hpp`
+  - retains the propagated body rotation together with the antenna prediction
+    at the deferred GNSS timestamp;
+- `src/laserMapping.cpp`
+  - defers external GNSS origin initialization to the timestamp-matched stage;
+  - buffers raw local GNSS displacement before applying camera-frame alignment;
+  - skips covariance modification and position correction for the origin-only
+    first sample.
+
+### Validation
+
+The same `raw1_beta_drive.bag` input was executed once with a lightweight
+recording and once while recording the full 1.1 GB evaluation topic set. Both
+runs initialized exactly the same origin:
+
+```text
+first GNSS timestamp: 107.973000000 s
+camera GNSS origin:  [-1.493769849, -0.027259919, 1.036219187]
+```
+
+Across the 1,946 samples shared by both runs:
+
+```text
+maximum timestamp difference: 0 s
+mean position difference:     0 m
+position RMSE difference:     0 m
+maximum position difference:  0 m
+```
+
+The complete full-load evaluation produced:
+
+| Metric | Result |
+|---|---:|
+| XY mean error | 0.104 m |
+| XY RMSE | 0.126 m |
+| XY maximum error | 0.548 m |
+| XY final error | 0.150 m |
+| Final error / path length | 0.047% |
+| Longitudinal RMSE | 0.074 m |
+| Lateral RMSE | 0.101 m |
+
+The fix removes callback-scheduling dependence from the tested first-origin
+path. It is not a full arbitrary-delay state rewind: a GNSS sample outside the
+current IMU propagation interval is still rejected rather than applied at the
+wrong time.
+
 ### Remaining limitation observed after the correction
 
 The timestamp correction improves absolute position and removes most of the
 longitudinal lag, but it exposes velocity-state error more clearly during
 stops. FAST-LIO can retain nonzero velocity while repeated GNSS position
 updates pull the pose back, producing position jitter and excessive
-accumulated path length. In this validation, the estimated path-length error
-increased from about +5.40 m to +15.11 m despite the lower absolute position
-error.
+accumulated path length. In the final full-load validation, the estimated
+path-length error was +16.74 m despite the low absolute position error.
 
 This should be addressed separately through velocity-state validation and a
 robust stationary constraint such as ZUPT. It should not be hidden by
